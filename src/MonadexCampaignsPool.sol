@@ -35,14 +35,18 @@ contract MonadexCampaignsPool is Ownable, IMonadexCampaignsPool {
     address private immutable i_saleToken;
     address private immutable i_fundingToken;
     uint256 private immutable i_fundingTokenVirtualAmount;
-    uint256 private immutable i_priceThreshold;
     uint256 private immutable i_endingTimestamp;
+    uint256 private immutable i_vestingCliff;
 
     uint256 private s_reserveSaleToken;
     uint256 private s_reserveFundingToken;
+    MonadexCampaignsTypes.PriceThreshold private s_priceThreshold;
     bool private s_isLocked;
 
     MonadexCampaignsTypes.Stage private s_stage;
+
+    uint256 constant VESTING_INTERVAL = 1 weeks;
+    uint256 private vestedAmount;
 
     event SaleTokensPurchased(
         uint256 indexed saleTokenAmount,
@@ -69,35 +73,54 @@ contract MonadexCampaignsPool is Ownable, IMonadexCampaignsPool {
         _;
     }
 
-    constructor(
-        MonadexCampaignsTypes.CreateCampaign memory _campaignParams,
-        address _owner
-    )
-        Ownable(_owner)
-    {
+    constructor(MonadexCampaignsTypes.CreateCampaign memory _campaignParams) Ownable(msg.sender) {
         i_team = _campaignParams.team;
         i_saleToken = _campaignParams.saleToken;
         i_fundingToken = _campaignParams.fundingToken;
         i_fundingTokenVirtualAmount = _campaignParams.fundingTokenVirtualAmount;
-        i_priceThreshold = _campaignParams.priceThreshold;
         i_endingTimestamp = _campaignParams.endingTimestamp;
+        i_vestingCliff = _campaignParams.vestingCliff;
 
         s_reserveSaleToken = _campaignParams.saleTokenAmount;
         s_reserveFundingToken = _campaignParams.fundingTokenVirtualAmount;
+        s_priceThreshold = _campaignParams.priceThreshold;
 
-        s_stage = MonadexCampaignsTypes.Stage.Stage1;
+        s_stage = hasCrossedStage1()
+            ? MonadexCampaignsTypes.Stage.Stage2
+            : MonadexCampaignsTypes.Stage.Stage1;
     }
 
-    function purchaseSaleTokens(address _receiver) external beforeEnd globalLock {
+    function purchaseSaleTokens(address _receiver)
+        external
+        beforeEnd
+        globalLock
+        returns (uint256)
+    {
         uint256 fundingTokenAmount = IERC20(i_fundingToken).balanceOf(address(this))
             - s_reserveFundingToken - i_fundingTokenVirtualAmount;
         if (fundingTokenAmount == 0) revert MonadexCampaignsPool__ZeroAmount();
 
+        uint256 saleTokensToPurchase;
         if (s_stage == MonadexCampaignsTypes.Stage.Stage1) {
-            _purchaseTokensInStage1(fundingTokenAmount);
+            if (hasCrossedStage1()) {
+                s_stage = MonadexCampaignsTypes.Stage.Stage2;
+                saleTokensToPurchase = _purchaseTokensInStage2(fundingTokenAmount);
+            } else {
+                saleTokensToPurchase = _purchaseTokensInStage1(fundingTokenAmount);
+            }
         } else {
-            _purchaseTokensInStage2(fundingTokenAmount);
+            saleTokensToPurchase = _purchaseTokensInStage2(fundingTokenAmount);
         }
+        if (saleTokensToPurchase == 0) revert MonadexCampaignsPool__ZeroAmount();
+
+        _updateReserves(
+            s_reserveSaleToken - saleTokensToPurchase, s_reserveFundingToken + fundingTokenAmount
+        );
+        IERC20(i_saleToken).safeTransfer(_receiver, saleTokensToPurchase);
+
+        emit SaleTokensPurchased(saleTokensToPurchase, fundingTokenAmount, _receiver);
+
+        return saleTokensToPurchase;
     }
 
     function syncBalancesWithReserves(address _receiver) external onlyOwner globalLock {
@@ -123,11 +146,15 @@ contract MonadexCampaignsPool is Ownable, IMonadexCampaignsPool {
         return i_fundingTokenVirtualAmount;
     }
 
-    function getPriceThreshold() external view returns (uint256) {
-        return i_priceThreshold;
+    function getPriceThreshold()
+        external
+        view
+        returns (MonadexCampaignsTypes.PriceThreshold memory)
+    {
+        return s_priceThreshold;
     }
 
-    function getDuration() external view returns (uint256) {
+    function getEndingTimestamp() external view returns (uint256) {
         return i_endingTimestamp;
     }
 
@@ -135,20 +162,28 @@ contract MonadexCampaignsPool is Ownable, IMonadexCampaignsPool {
         return s_stage;
     }
 
-    function _purchaseTokensInStage1(uint256 _fundingTokenAmount, address _receiver) internal {
-        uint256 saleTokensToPurchase = MonadexCampaignsLibrary.amountToPurchaseInStage1(
-            s_reserveSaleToken, s_reserveFundingToken, _fundingTokenAmount
-        );
-        _updateReserves(
-            s_reserveSaleToken - saleTokensToPurchase, s_reserveFundingToken + _fundingTokenAmount
-        );
-
-        IERC20(i_saleToken).safeTransfer(_receiver, saleTokensToPurchase);
-
-        emit SaleTokensPurchased(saleTokensToPurchase, _fundingTokenAmount, _receiver);
+    function getReserves() external view returns (uint256, uint256) {
+        return (s_reserveSaleToken, s_reserveFundingToken);
     }
 
-    function _purchaseTokensInStage2(uint256 _fundingTokenAmount) internal { }
+    function hasCrossedStage1() public view returns (bool) {
+        if (
+            s_reserveSaleToken <= s_priceThreshold.saleTokenAmount
+                && s_reserveFundingToken >= s_priceThreshold.fundingTokenAmount
+        ) return true;
+        return false;
+    }
+
+    function _purchaseTokensInStage1(uint256 _fundingTokenAmount) internal view returns (uint256) {
+        return MonadexCampaignsLibrary.amountToPurchaseInStage1(
+            s_reserveSaleToken, s_reserveFundingToken, _fundingTokenAmount
+        );
+    }
+
+    function _purchaseTokensInStage2(uint256 _fundingTokenAmount) internal view returns (uint256) {
+        return
+            MonadexCampaignsLibrary.amountToPurchaseInStage2(_fundingTokenAmount, s_priceThreshold);
+    }
 
     function _updateReserves(uint256 _saleTokenAmount, uint256 _fundingTokenAmount) internal {
         s_reserveSaleToken = _saleTokenAmount;
